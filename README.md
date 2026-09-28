@@ -1,7 +1,52 @@
 # metadata-catalog-go
 
-可本地运行的元数据目录服务：支持多来源摄入、版本化结构演进、血缘维护与影响分析。
-在重复、乱序和并发写入下保持可追溯且结论稳定。
+可本地长期运行的元数据目录服务：支持多来源摄入、版本化结构演进、血缘维护与影响分析。
+状态持久化到本地文件，进程重启后自动恢复；在重复、乱序和并发写入下保持可追溯且结论稳定。
+
+## 本地常驻服务
+
+`cmd/catalogd` 把读取和写入都以 HTTP JSON API 暴露出来，可直接起在本地，
+用 curl 或脚本调用：
+
+```bash
+go run ./cmd/catalogd -addr 127.0.0.1:8080 -data catalog-data.json
+```
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/entities` | 摄入实体（body 为 Entity JSON） |
+| POST | `/api/relations` | 摄入关系（body 为 Relation JSON） |
+| POST | `/api/evolve` | 结构演进（`entity_id`/`schema`/`renames`/`source`/`version`） |
+| POST | `/api/merge` | 合并实体（`dst`/`src`/`source`/`version`） |
+| GET | `/api/entities`、`/api/entities/{id}` | 查询实体 |
+| GET | `/api/relations` | 查询全部关系 |
+| GET | `/api/rejections` | 查询全部拒绝记录 |
+| GET | `/api/impact?root=ID&tags=a,b&terms=..&owners=..` | 影响分析 |
+
+写入响应统一为 `{"applied":..,"duplicate":..,"rejection":{..}}`：
+接受/重复返回 200，判定拒绝返回 409（`rejection.reason` 可区分原因），
+持久化失败返回 500（`error` 字段）。
+
+示例：
+
+```bash
+curl -X POST localhost:8080/api/entities -d '{"id":"orders","kind":"dataset","source":"etl-a","version":2,"schema":{"fields":[{"name":"id","type":"int","required":true}]}}'
+curl localhost:8080/api/rejections
+curl 'localhost:8080/api/impact?root=orders&tags=finance'
+```
+
+## 持久化与恢复
+
+- 每次状态变更（实体/关系写入、合并、拒绝记录）后，将完整状态以 JSON
+  **整体快照**写入 `-data` 指定文件：先写临时文件再 `rename` 原子替换，
+  崩溃不会留下半截文件。
+- 重启时一次性加载快照，实体、关系、**历次拒绝记录**（含单调递增 `Seq`）
+  全部恢复，恢复后的状态与重启前完全一致。
+- 重启前被判为重复的提交，重启后再提交**仍然是重复**；乱序/冲突写入重启后
+  仍按相同原因拒绝，`Seq` 接续不重置、不重复计数；以更高版本重试继续收敛到
+  一致状态。
+- 兼容范围：快照格式为当前版本的 JSON 结构，向后兼容不在本版本承诺范围内；
+  纯内存用法（`catalog.New()`）行为不变。
 
 ## 元数据模型
 
@@ -23,13 +68,19 @@
 | 情形 | 结果 | 持久化原因 |
 |---|---|---|
 | 版本高于当前 | 接受（Applied） | — |
-| 同版本同内容 | 幂等成功（Duplicate） | — |
+| 同版本同内容（**忽略来源**，跨来源重复也算） | 幂等成功（Duplicate） | — |
 | 同版本不同内容（并发冲突） | 拒绝 | `VERSION_CONFLICT` |
 | 版本低于当前（乱序） | 拒绝，不覆盖新版本 | `STALE_VERSION` |
 | 写入已合并实体 | 拒绝 | `ENTITY_MERGED` |
 | 引用不存在的实体 | 边保留为悬挂，记录日志 | `DANGLING_REFERENCE` |
 | 结构演进不兼容 | 拒绝，状态不变 | `SCHEMA_INCOMPATIBLE` |
-| 合并双方字段类型冲突 / 重复合并 | 拒绝 | `MERGE_CONFLICT` |
+| 合并双方字段类型冲突 / 重复合并 / 自我合并 | 拒绝 | `MERGE_CONFLICT` |
+
+**多来源重复与冲突的判定边界**：实体与关系的"内容相同"比较都**忽略
+`Source` 字段**——同一实体/关系从不同来源重复提交，只要内容实质相同就统一
+按幂等重复处理，不会误报冲突；但同版本而内容（结构、标签、关系类型、端点等）
+真正不同的写入仍判为 `VERSION_CONFLICT`。判定规则固定：同样的输入在重启前后、
+任何部署规模下都给出同样的结论与同样的原因。
 
 冲突方以更高版本号重试即可恢复一致状态（见
 `TestConcurrentUpdatesConflictAndRetry`）。
@@ -41,21 +92,31 @@
 - 类型加宽（`int→float`、`int/float/bool→string`）：兼容；其余类型变化：不兼容。
 
 **实体合并**：`MergeEntities(dst, src)` 将指向 src 的关系重定向到 dst，
-标签/术语/所有者取并集，src 标记 `MergedInto`；双方同名字段类型冲突时
-整体拒绝且状态不变。
+标签/术语/所有者取并集，src 标记 `MergedInto`；双方同名字段类型冲突、
+重复合并或自我合并时整体拒绝且状态不变。
+
+**合并的一致性边界（不丢边）**：重定向按确定性两阶段执行（先按原 ID 排序
+收集受影响边，再统一重写），保证一条边都不丢：
+
+- 重定向后产生的**自环**（src==dst）保留，不静默丢弃；
+- 重定向后的规范 ID 与已有边冲突时，保留原 ID 作为确定性去重键，
+  **重复边**因此两条都在、`Relations` 可查；
+- 相同输入的合并结果逐字节一致（见 `TestMergePreservesAllEdges`）。
 
 ## 影响分析的边界
 
 `Impact(root, filter)` 从起点沿血缘下游（src→dst 方向）做 BFS：
 
-- **循环**：visited 集合保证每个节点只展开一次；成环的边被截断并列入
-  `CycleEdges`，不会无限遍历。
+- **一致性**：查询基于 `Store.Snapshot()` 在**单次读锁**内取走的实体+关系
+  快照，持续写入期间单次查询看到的一定是某一时刻的完整状态，
+  不会一半旧数据一半新数据（见 `TestImpactConsistentSnapshotDuringWrites`）。
+- **循环**：visited 集合保证每个节点只展开一次；成环的边（含合并产生的
+  自环）被截断并列入 `CycleEdges`，不会无限遍历。
 - **悬挂引用**：目标不存在的边不静默丢弃，目标 ID 列入 `DanglingIDs`，
   但不作为节点展开。
 - **筛选**：按 `Tags` / `Terms` / `Owners` 过滤（任一命中即保留）；
   被过滤的节点不出现在结果中，但其下游仍会被遍历。
-- **一致性**：查询基于 `RWMutex` 保护的快照，持续写入期间单次查询结果
-  内部一致；输出按实体 ID 排序，保证确定性。
+- **确定性**：输出按实体 ID 排序，相同图状态下结果可复现。
 
 ## 本地验证
 
@@ -63,8 +124,17 @@
 go build ./...        # 编译
 go test ./... -v      # 单元测试（日志含关键输入、版本号与判定依据）
 go test -race ./...   # 竞态检测
-go run ./cmd/catalog  # 端到端演示：摄入/演进/血缘/合并/拒绝日志
+go run ./cmd/catalog  # 内存版端到端演示：摄入/演进/血缘/合并/拒绝日志
+
+# 常驻服务 + 重启恢复冒烟：
+go run ./cmd/catalogd -addr 127.0.0.1:8080 -data /tmp/catalog.json &
+curl -X POST localhost:8080/api/entities -d '{"id":"a","kind":"dataset","source":"s1","version":1,"schema":{"fields":[]}}'
+kill %1                # 模拟重启
+go run ./cmd/catalogd -addr 127.0.0.1:8080 -data /tmp/catalog.json &
+curl localhost:8080/api/entities    # 状态已恢复
 ```
 
 测试覆盖：重复与乱序摄入、并发更新冲突与重试、兼容/不兼容结构演进、
-显式改名、循环血缘、悬挂引用、合并冲突、写入期间查询一致性。
+显式改名、循环血缘、悬挂引用、合并冲突、写入期间查询一致性，以及本轮新增：
+重启后恢复（实体/关系/拒绝记录与 `Seq` 接续）、跨来源重复提交（实体与关系）、
+合并不丢边（重复边与自环确定性保留）、持续写入期间影响分析的快照一致性。

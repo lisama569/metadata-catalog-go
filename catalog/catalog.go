@@ -12,6 +12,16 @@ func New() *Catalog {
 	return &Catalog{store: NewStore()}
 }
 
+// Open 打开（不存在则创建）持久化目录；
+// 重启后实体、关系与拒绝记录完整恢复，判定行为与重启前一致。
+func Open(path string) (*Catalog, error) {
+	s, err := OpenStore(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Catalog{store: s}, nil
+}
+
 // Store 暴露底层存储（只读用途）。
 func (c *Catalog) Store() *Store { return c.store }
 
@@ -30,18 +40,19 @@ func (c *Catalog) IngestRelation(r Relation) UpsertResult {
 func (c *Catalog) EvolveSchema(entityID string, next Schema, renames []RenameHint, source string, version int64) (Verdict, UpsertResult) {
 	cur, ok := c.store.GetEntity(entityID)
 	if !ok {
-		return Verdict{Compatible: false}, UpsertResult{Rejection: c.store.RecordRejection(Rejection{
+		rej, err := c.store.RecordRejection(Rejection{
 			Reason: ReasonEntityNotFound, EntityID: entityID, Source: source, Version: version,
 			Detail: "cannot evolve schema of missing entity",
-		})}
+		})
+		return Verdict{Compatible: false}, UpsertResult{Rejection: rej, Err: err}
 	}
 	verdict := CheckCompatibility(cur.Schema, next, renames)
 	if !verdict.Compatible {
-		res := UpsertResult{Rejection: c.store.RecordRejection(Rejection{
+		rej, err := c.store.RecordRejection(Rejection{
 			Reason: ReasonSchemaIncompatible, EntityID: entityID, Source: source, Version: version,
 			Detail: fmt.Sprintf("schema evolution rejected: %d incompatible change(s)", countIncompatible(verdict)),
-		})}
-		return verdict, res
+		})
+		return verdict, UpsertResult{Rejection: rej, Err: err}
 	}
 	nextEntity := cur
 	nextEntity.Schema = next
