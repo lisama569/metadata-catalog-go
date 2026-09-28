@@ -7,10 +7,23 @@ type Catalog struct {
 	store *Store
 }
 
-// New 创建空目录。
+// New 创建空目录（纯内存）。
 func New() *Catalog {
 	return &Catalog{store: NewStore()}
 }
+
+// Open 打开（或创建）dir 下的持久化目录：重放 WAL 恢复状态，
+// 之后所有写入先落盘再生效，进程重启后状态完整恢复。
+func Open(dir string) (*Catalog, error) {
+	s, err := OpenStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &Catalog{store: s}, nil
+}
+
+// Close 关闭底层持久化日志。
+func (c *Catalog) Close() error { return c.store.Close() }
 
 // Store 暴露底层存储（只读用途）。
 func (c *Catalog) Store() *Store { return c.store }

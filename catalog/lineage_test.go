@@ -144,6 +144,40 @@ func TestMergeConflictRejected(t *testing.T) {
 	}
 }
 
+// 影响分析必须基于单次加锁的一致性快照：写入方先写实体再写关系，
+// 查询方绝不应看到"关系已存在但实体缺失"的伪悬挂（两半不同时间的图）。
+func TestImpactUsesConsistentSnapshot(t *testing.T) {
+	c := New()
+	c.IngestEntity(testEntity("root", 1))
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("leaf-%03d", i)
+			c.IngestEntity(testEntity(id, 1)) // 先实体
+			addLineage(c, "root", id, 1)      // 后关系
+		}(i)
+	}
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rep := c.Impact("root", ImpactFilter{})
+			if len(rep.DanglingIDs) != 0 {
+				t.Errorf("inconsistent snapshot: dangling targets %v but all entities exist", rep.DanglingIDs)
+			}
+			// 每个节点的 via 路径必须内部连贯：相邻节点间都有边。
+			for _, n := range rep.Nodes {
+				if len(n.Via) == 0 || n.Via[0] != "root" || n.Via[len(n.Via)-1] != n.EntityID {
+					t.Errorf("incoherent via path for %s: %v", n.EntityID, n.Via)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func TestQueryConsistentDuringWrites(t *testing.T) {
 	c := New()
 	c.IngestEntity(testEntity("root", 1))

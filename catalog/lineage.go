@@ -26,16 +26,17 @@ type ImpactReport struct {
 }
 
 // ImpactAnalysis 从 root 出发沿血缘下游（src -> dst 方向）做影响分析。
-// 基于 Store 的一致性快照执行，持续写入期间结果稳定；
+// 基于 Store 的单次加锁一致性快照执行，持续写入期间单次查询内部一致；
 // 使用 visited 集合防止循环导致无限遍历；输出按 ID 排序保证确定性。
 func ImpactAnalysis(s *Store, root string, filter ImpactFilter) ImpactReport {
+	snap := s.Snapshot()
 	entities := map[string]Entity{}
-	for _, e := range s.Entities() {
+	for _, e := range snap.Entities {
 		entities[e.ID] = e
 	}
 	// 下游邻接表：src -> []dst（排序保证确定性）。
 	adj := map[string][]string{}
-	for _, r := range s.Relations() {
+	for _, r := range snap.Relations {
 		if r.Type != RelationLineage {
 			continue
 		}
