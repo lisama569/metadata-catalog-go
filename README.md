@@ -45,6 +45,9 @@ curl 'localhost:8080/api/impact?root=orders&tags=finance'
 - 重启前被判为重复的提交，重启后再提交**仍然是重复**；乱序/冲突写入重启后
   仍按相同原因拒绝，`Seq` 接续不重置、不重复计数；以更高版本重试继续收敛到
   一致状态。
+- 纯重复提交（包括目标实体缺失时跨来源重复同一条悬挂关系）不改变状态，
+  **不触发落盘**；告警/拒绝记录与其对应的边在同一次快照中一起持久化，
+  保证内存状态与磁盘快照始终一一对应，重启前后不多不少。
 - 兼容范围：快照格式为当前版本的 JSON 结构，向后兼容不在本版本承诺范围内；
   纯内存用法（`catalog.New()`）行为不变。
 
@@ -72,7 +75,8 @@ curl 'localhost:8080/api/impact?root=orders&tags=finance'
 | 同版本不同内容（并发冲突） | 拒绝 | `VERSION_CONFLICT` |
 | 版本低于当前（乱序） | 拒绝，不覆盖新版本 | `STALE_VERSION` |
 | 写入已合并实体 | 拒绝 | `ENTITY_MERGED` |
-| 引用不存在的实体 | 边保留为悬挂，记录日志 | `DANGLING_REFERENCE` |
+| 引用不存在的实体（边真正写入时） | 边保留为悬挂，记录日志 | `DANGLING_REFERENCE` |
+| 悬挂边的跨来源重复提交 | 幂等成功（Duplicate），不再记录 | — |
 | 结构演进不兼容 | 拒绝，状态不变 | `SCHEMA_INCOMPATIBLE` |
 | 合并双方字段类型冲突 / 重复合并 / 自我合并 | 拒绝 | `MERGE_CONFLICT` |
 
@@ -84,6 +88,26 @@ curl 'localhost:8080/api/impact?root=orders&tags=finance'
 
 冲突方以更高版本号重试即可恢复一致状态（见
 `TestConcurrentUpdatesConflictAndRetry`）。
+
+**目标实体缺失时跨来源重复提交的判定与记录语义**：关系指向的实体尚未提交
+（悬挂边）时，处理顺序固定为"**先幂等/版本判定，后悬挂告警**"：
+
+- 某来源**首次真正写入**这条边（新增边或更新到新版本）且目标实体仍缺失时，
+  边保留为悬挂，并记录**恰好一条** `DANGLING_REFERENCE`（占用一个 `Seq`）。
+- 之后任意来源（含原来源）提交内容相同、仅 `Source` 不同的同一条关系，一律
+  算**幂等重复**：不新增边、不新增拒绝/告警记录、`Seq` 不跳号，重复结论本身
+  也不触发落盘（没有状态变化可持久化）。
+- 悬挂边上的**真冲突**（同版本内容不同）仍判 `VERSION_CONFLICT`、旧版本覆盖
+  仍判 `STALE_VERSION`；被拒绝的提交不附带悬挂告警。即"首次悬挂记录"不会被
+  重复逻辑吞掉，冲突/乱序也不会被误降级为重复。
+
+**重启恢复后的状态一致性**：告警与边在同一次快照落盘，纯重复不改变任何状态，
+因此跨来源重复之后，无论马上重启、先穿插一次其他成功写入再重启，还是再重启
+一次，恢复出的实体、关系、拒绝记录（含 `Seq`）都与重启前查询到的完全一致；
+多个来源并发重复提交、或重启后并发重试同样收敛到"一条边 + 一条悬挂告警"，
+不会出现运行中多一条、重启后少一条，或换个写入顺序就多一条（见
+`TestDanglingDuplicateStateConsistentAcrossRestart`、
+`TestConcurrentCrossSourceDuplicateDanglingRelation`）。
 
 **结构演进兼容性规则**（规则固定，相同输入结论可复现）：
 
@@ -132,9 +156,27 @@ curl -X POST localhost:8080/api/entities -d '{"id":"a","kind":"dataset","source"
 kill %1                # 模拟重启
 go run ./cmd/catalogd -addr 127.0.0.1:8080 -data /tmp/catalog.json &
 curl localhost:8080/api/entities    # 状态已恢复
+
+# 目标实体缺失时跨来源重复提交 + 重启一致性冒烟：
+# 首次提交产生 applied + 恰好一条 DANGLING_REFERENCE(seq=1)；
+# 换来源重复提交为 duplicate 且 /api/rejections 数量不变；
+# kill 重启后再重复提交仍为 duplicate，告警仍恰好一条。
+curl -X POST localhost:8080/api/relations -d '{"type":"lineage","src_id":"a","dst_id":"ghost","source":"etl-a","version":1}'
+curl -X POST localhost:8080/api/relations -d '{"type":"lineage","src_id":"a","dst_id":"ghost","source":"etl-b","version":1}'
+curl localhost:8080/api/rejections   # 始终只有 seq=1 一条
+```
+
+针对本轮修复的用例可单独复现：
+
+```bash
+go test ./catalog/ -run 'Dangling|CrossSourceDuplicate' -v   # 含重启前后对照/穿插写入
+go test -race -count=10 ./catalog/ -run 'ConcurrentCrossSourceDuplicateDanglingRelation'
 ```
 
 测试覆盖：重复与乱序摄入、并发更新冲突与重试、兼容/不兼容结构演进、
 显式改名、循环血缘、悬挂引用、合并冲突、写入期间查询一致性，以及本轮新增：
 重启后恢复（实体/关系/拒绝记录与 `Seq` 接续）、跨来源重复提交（实体与关系）、
-合并不丢边（重复边与自环确定性保留）、持续写入期间影响分析的快照一致性。
+合并不丢边（重复边与自环确定性保留）、持续写入期间影响分析的快照一致性、
+**目标实体缺失时跨来源重复悬挂关系（纯重复不增记录/不跳号、重启前后与穿插
+写入后状态一致、并发重复与重启后并发重试收敛，且真冲突/乱序/首次悬挂记录
+不被吞掉）**。

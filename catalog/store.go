@@ -89,6 +89,9 @@ func entitiesEqual(a, b Entity) bool {
 }
 
 // UpsertRelation 写入关系；悬挂引用会被保留并记录。
+// 判定顺序固定为先幂等/版本检查、后悬挂告警：跨来源重复提交同一条悬挂
+// 关系只返回 Duplicate，不新增 DANGLING_REFERENCE 记录、不推进 Seq；
+// 只有真正写入（新增或更新到新版本）且目标缺失时才记录一条悬挂告警。
 func (s *Store) UpsertRelation(r Relation) UpsertResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -96,13 +99,10 @@ func (s *Store) UpsertRelation(r Relation) UpsertResult {
 	if r.ID == "" {
 		r.ID = RelationID(r.Type, r.SrcID, r.DstID)
 	}
-	// 悬挂引用：保留边，但记录可追溯的拒绝/告警日志。
-	if _, ok := s.entities[r.DstID]; !ok {
-		s.record(Rejection{
-			Reason: ReasonDanglingReference, Relation: r.ID, Source: r.Source, Version: r.Version,
-			Detail: fmt.Sprintf("relation %s targets missing entity %s; edge kept as dangling", r.ID, r.DstID),
-		})
-	}
+	// 先做幂等/版本判定，再处理悬挂引用：
+	// 跨来源重复提交同一条悬挂关系必须只算重复——既不能再记一条
+	// DANGLING_REFERENCE（否则可追溯序号会凭空往前跳），重复结论也不触发
+	// 落盘（否则会出现运行中多一条、重启后少一条的不一致）。
 	cur, ok := s.relations[r.ID]
 	if ok {
 		switch {
@@ -114,6 +114,7 @@ func (s *Store) UpsertRelation(r Relation) UpsertResult {
 			return UpsertResult{Rejection: rej, Err: s.persistLocked()}
 		case r.Version == cur.Version:
 			if relationsEqual(*cur, r) {
+				// 纯幂等重复：状态、拒绝日志、序号均不变。
 				return UpsertResult{Duplicate: true}
 			}
 			rej := s.record(Rejection{
@@ -125,6 +126,15 @@ func (s *Store) UpsertRelation(r Relation) UpsertResult {
 	}
 	cp := r
 	s.relations[r.ID] = &cp
+	// 真正写入（新增边或更新到新版本）时目标实体仍缺失，才记录悬挂告警：
+	// 每个来源首次提交得到一条可追溯记录，重复与被拒绝的提交不追加，
+	// 且告警与边在同一次落盘内一起持久化，重启前后完全一致。
+	if _, exists := s.entities[r.DstID]; !exists {
+		s.record(Rejection{
+			Reason: ReasonDanglingReference, Relation: r.ID, Source: r.Source, Version: r.Version,
+			Detail: fmt.Sprintf("relation %s targets missing entity %s; edge kept as dangling", r.ID, r.DstID),
+		})
+	}
 	return UpsertResult{Applied: true, Err: s.persistLocked()}
 }
 
