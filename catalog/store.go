@@ -96,13 +96,8 @@ func (s *Store) UpsertRelation(r Relation) UpsertResult {
 	if r.ID == "" {
 		r.ID = RelationID(r.Type, r.SrcID, r.DstID)
 	}
-	// 悬挂引用：保留边，但记录可追溯的拒绝/告警日志。
-	if _, ok := s.entities[r.DstID]; !ok {
-		s.record(Rejection{
-			Reason: ReasonDanglingReference, Relation: r.ID, Source: r.Source, Version: r.Version,
-			Detail: fmt.Sprintf("relation %s targets missing entity %s; edge kept as dangling", r.ID, r.DstID),
-		})
-	}
+	// 先做版本与重复判定：重复/乱序/冲突的提交不得产生任何新记录，
+	// 保证同一关系跨来源重复提交时拒绝日志与序号都原地不动。
 	cur, ok := s.relations[r.ID]
 	if ok {
 		switch {
@@ -122,6 +117,15 @@ func (s *Store) UpsertRelation(r Relation) UpsertResult {
 			})
 			return UpsertResult{Rejection: rej, Err: s.persistLocked()}
 		}
+	}
+	// 真正落地写入（新边或更高版本）时才检查悬挂引用：
+	// 边保留，但记录一条可追溯的拒绝/告警日志；
+	// 重复提交不会走到这里，因此不会重复记录、序号也不会空跳。
+	if _, ok := s.entities[r.DstID]; !ok {
+		s.record(Rejection{
+			Reason: ReasonDanglingReference, Relation: r.ID, Source: r.Source, Version: r.Version,
+			Detail: fmt.Sprintf("relation %s targets missing entity %s; edge kept as dangling", r.ID, r.DstID),
+		})
 	}
 	cp := r
 	s.relations[r.ID] = &cp
